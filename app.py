@@ -1,197 +1,260 @@
 import streamlit as st
 import requests
 import datetime
+import math
 import random
-import time
+import pandas as pd
 from collections import Counter
-import itertools
 
-# --- 1. 시스템 설정 (ASI Design Protocol) ---
-st.set_page_config(
-    page_title="NEXUS V2.1 | Commander System",
-    page_icon="🧬",
-    layout="centered",
-    initial_sidebar_state="collapsed"
-)
+# --- [시스템 설정: NEXUS V4.1 MLRS] ---
+# 사령관님이 정의한 신의 가중치
+FEATURE_WEIGHTS = [1.0, 1.5, 0.5, 1.8]  # [Sum, Range, Odd, AC]
+VECTOR_WINDOW = 10     # 10주 패턴
+ENSEMBLE_COUNT = 3     # Top 3 앙상블
+SEARCH_DEPTH = 350     # 탐색 깊이 (약 7년)
+GAME_COUNT = 10        # 1회 생성 게임 수
 
-# 스타일링 (네온 사이버펑크 테마 & 다크 모드)
+# --- [UI 디자인: 다크 사이버펑크 테마] ---
+st.set_page_config(page_title="NEXUS AI | Lotto System", page_icon="🧬", layout="wide")
+
 st.markdown("""
-    <style>
-    .main { background-color: #0E1117; color: #FAFAFA; }
-    .stButton>button {
-        width: 100%; background-color: #00FF99; color: black;
-        font-weight: bold; border-radius: 10px; height: 60px;
-        font-size: 20px; box-shadow: 0 0 15px rgba(0, 255, 153, 0.4);
-        border: none;
+<style>
+    .stApp { background-color: #0E1117; color: #00FF00; }
+    .title-box {
+        text-align: center; border: 2px solid #00FF00; padding: 20px;
+        border-radius: 10px; margin-bottom: 20px;
+        background: linear-gradient(45deg, #000000, #111111);
     }
-    .stButton>button:hover { background-color: #00CC7A; box-shadow: 0 0 25px #00FF99; }
-    .title-text {
-        text-align: center; font-size: 38px; font-weight: 800;
-        background: linear-gradient(90deg, #00FF99, #00CCFF);
-        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-        margin-bottom: 0px;
+    .main-title { font-size: 40px; font-weight: bold; color: #00FF00; margin: 0; }
+    .sub-title { font-size: 15px; color: #888888; }
+    .metric-card {
+        background-color: #1A1A1A; border: 1px solid #333;
+        padding: 15px; border-radius: 8px; text-align: center;
     }
-    .status-badge {
-        text-align: center; color: #888; font-size: 14px; margin-bottom: 20px;
+    .result-row {
+        font-family: 'Courier New', monospace; font-size: 18px;
+        padding: 10px; border-bottom: 1px solid #333;
     }
-    .result-box {
-        background-color: #1A1A1A; padding: 15px; border-radius: 12px;
-        border-left: 5px solid #00FF99; margin-bottom: 12px;
-        text-align: center; font-size: 20px; font-family: 'Courier New', monospace;
-    }
-    .core-num { color: #FF4B4B; font-weight: 900; font-size: 1.1em; }
-    .sat-num { color: #00CCFF; font-weight: bold; }
-    .analysis-text { font-size: 14px; color: #CCCCCC; }
-    </style>
+    .highlight { color: #00FF00; font-weight: bold; }
+</style>
 """, unsafe_allow_html=True)
 
-# --- 2. 로직 엔진: 데이터 수집 및 분석 ---
+# --- [CORE ENGINE: 데이터 수집 & 전처리] ---
 
-@st.cache_data(ttl=3600) # 1시간마다 데이터 갱신 (서버 부하 방지)
-def get_recent_lotto_data(rounds):
-    """
-    동행복권 API를 통해 최근 n회차 데이터를 긁어옵니다.
-    """
-    # 1. 현재 예상 회차 계산 (2002-12-07 시작 기준)
+@st.cache_data(ttl=3600)  # 1시간마다 데이터 갱신 (서버 부하 방지)
+def fetch_lotto_data(depth):
+    # 현재 회차 자동 계산
     start_date = datetime.datetime(2002, 12, 7)
     now = datetime.datetime.now()
+    # 토요일 21시 이전이면 전주 회차 기준
+    if now.weekday() == 5 and now.hour < 21:
+        days_diff = (now - start_date).days - 7
+    else:
+        days_diff = (now - start_date).days
+        
+    current_drw_no = (days_diff // 7) + 1
     
-    # 단순 날짜 차이로 회차 계산
-    diff_days = (now - start_date).days
-    current_estimated_round = (diff_days // 7) + 1
+    data = []
+    collected = 0
+    drw_no = current_drw_no
     
-    # 토요일 21시 이전이면 아직 추첨 전이므로 이전 회차가 최신 데이터임
-    # 하지만 API 호출 시 안전하게 역추적 방식을 사용
-    
-    recent_numbers = []
-    found_count = 0
-    check_round = current_estimated_round
-    
-    # API 역추적 (최신 회차부터 데이터를 찾을 때까지)
-    # 미래 회차를 호출하면 null이 오므로, 데이터가 있는 회차를 찾을 때까지 뒤로 탐색
-    while found_count < rounds:
-        url = f"https://www.dhlottery.co.kr/common.do?method=getLottoNumber&drwNo={check_round}"
+    # API 역추적
+    while collected < depth and drw_no > 0:
         try:
-            response = requests.get(url, timeout=5).json()
-            
-            if response.get("returnValue") == "success":
-                nums = [response[f"drwtNo{i}"] for i in range(1, 7)]
-                recent_numbers.extend(nums)
-                found_count += 1
-            
-            # 실패(아직 추첨 안함) 시 그냥 넘어감
+            url = f"https://www.dhlottery.co.kr/common.do?method=getLottoNumber&drwNo={drw_no}"
+            res = requests.get(url, timeout=3).json()
+            if res["returnValue"] == "success":
+                row = {
+                    "drwNo": res["drwNo"],
+                    "nums": [res[f"drwtNo{i}"] for i in range(1, 7)]
+                }
+                data.append(row)
+                collected += 1
         except:
-            pass # 네트워크 에러 등 무시하고 계속 탐색
+            pass
+        drw_no -= 1
+        
+    return data, current_drw_no + 1
+
+# --- [CORE ENGINE: NEXUS V4.1 로직] ---
+
+def extract_normalized_features(nums_list):
+    # nums_list: [[1,2,3,4,5,6], ...] 형태
+    features = []
+    for nums in nums_list:
+        # 1. Sum (0~1)
+        s = sum(nums)
+        f_sum = s / 255.0
+        
+        # 2. Range (0~1)
+        r = nums[-1] - nums[0]
+        f_range = r / 44.0
+        
+        # 3. Odd Ratio (0~1)
+        odd = len([n for n in nums if n % 2 != 0])
+        f_odd = odd / 6.0
+        
+        # 4. AC Value (0~1)
+        diffs = set()
+        for i in range(len(nums)):
+            for j in range(i + 1, len(nums)):
+                diffs.add(nums[j] - nums[i])
+        ac = max(0, len(diffs) - 5)
+        f_ac = ac / 10.0
+        
+        features.append([f_sum, f_range, f_odd, f_ac])
+    return features
+
+def calculate_weighted_similarity(vec_a, vec_b, weights):
+    # vec_a, vec_b는 각각 10주치 특징 벡터 (10x4)
+    dot = 0; mag_a = 0; mag_b = 0
+    
+    # 1D로 펼쳐서 계산 (40차원 벡터)
+    flat_a = [item for sublist in vec_a for item in sublist]
+    flat_b = [item for sublist in vec_b for item in sublist]
+    
+    for i in range(len(flat_a)):
+        w = weights[i % 4] # 4개 특징 반복
+        val_a = flat_a[i] * w
+        val_b = flat_b[i] * w
+        
+        dot += val_a * val_b
+        mag_a += val_a ** 2
+        mag_b += val_b ** 2
+        
+    if mag_a == 0 or mag_b == 0: return 0
+    return dot / (math.sqrt(mag_a) * math.sqrt(mag_b))
+
+def refine_by_markov(pool_nums, recent_trend):
+    # 빈도 분석
+    counts = Counter(pool_nums)
+    # 빈도순 정렬
+    candidates = [num for num, _ in counts.most_common()]
+    
+    # 6개 채우기
+    selected = candidates[:6]
+    while len(selected) < 6:
+        r = random.randint(1, 45)
+        if r not in selected: selected.append(r)
+        
+    selected.sort()
+    
+    # 마르코프 변이 (Mutation)
+    # 최근 10회차의 Hot Number 파악
+    hot_nums = []
+    for row in recent_trend:
+        hot_nums.extend(row['nums'])
+    hot_counts = Counter(hot_nums)
+    
+    final_nums = list(selected)
+    for i in range(6):
+        num = final_nums[i]
+        # 해당 번호가 Hot하지 않고, 변이 확률(40%) 당첨시
+        if hot_counts[num] == 0 and random.random() > 0.6:
+            # Hot Number 중 하나로 교체 시도
+            hot_candidates = [n for n, _ in hot_counts.most_common(10)]
+            if hot_candidates:
+                rep = random.choice(hot_candidates)
+                if rep not in final_nums:
+                    final_nums[i] = rep
+                    
+    final_nums.sort()
+    return final_nums
+
+# --- [WEB APP 실행 로직] ---
+
+def main():
+    # 타이틀 섹션
+    st.markdown('<div class="title-box">'
+                '<p class="main-title">NEXUS V4.1</p>'
+                '<p class="sub-title">Advanced Singularity Intelligence Lotto System</p>'
+                '</div>', unsafe_allow_html=True)
+    
+    col1, col2 = st.columns([1, 3])
+    
+    with col1:
+        st.markdown("### ⚙️ SYSTEM STATUS")
+        st.info("ENGINE: ONLINE\n\nVERSION: V4.1 MLRS\n\nSERVER: GOOGLE CLOUD")
+        
+        # 사령관 옵션 조절
+        st.markdown("---")
+        st.markdown("**전략 파라미터 조정**")
+        w_ac = st.slider("AC값(복잡도) 가중치", 0.1, 3.0, 1.8)
+        w_range = st.slider("고저차 가중치", 0.1, 3.0, 1.5)
+        
+        # 엔진 재설정
+        global FEATURE_WEIGHTS
+        FEATURE_WEIGHTS = [1.0, w_range, 0.5, w_ac]
+        
+    with col2:
+        # 실행 버튼
+        if st.button("🚀 NEXUS 시스템 가동 (Analyze & Generate)", use_container_width=True):
+            with st.spinner("🛰️ 동행복권 서버 해킹(수집) 중..."):
+                history_data, next_round = fetch_lotto_data(SEARCH_DEPTH)
+                
+            if len(history_data) < VECTOR_WINDOW + 20:
+                st.error("데이터 수집 실패. 잠시 후 다시 시도하십시오.")
+                return
+
+            st.success(f"✅ 데이터 수집 완료 | 타겟: 제 **{next_round}회차**")
             
-        check_round -= 1
-        if check_round < 1: break # 안전장치
-        
-    # 마지막으로 확인된 회차의 다음 회차가 이번주 타겟
-    target_round = check_round + rounds + 1 
-    
-    return recent_numbers, target_round
-
-def analyze_vector_core(recent_nums):
-    """
-    ASI 벡터 로직: 최근 데이터 빈도 분석을 통해 Core(Hot)와 Satellite(Variable) 자동 추출
-    """
-    if not recent_nums:
-        return [1, 2, 3], [4, 5, 6, 7, 8] # 데이터 없을 시 기본값
-
-    count = Counter(recent_nums)
-    most_common = count.most_common()
-    
-    # 1. Core 추출 (Hot Zone)
-    # 상위 6개 빈출수 중 3개를 무작위로 선택 (과적합 방지)
-    hot_candidates = [num for num, freq in most_common[:6]] 
-    
-    # 후보가 적을 경우 보정
-    while len(hot_candidates) < 3:
-        missing = 3 - len(hot_candidates)
-        hot_candidates.extend(random.sample(range(1, 46), missing))
-        
-    core_nums = sorted(random.sample(hot_candidates, 3))
-    
-    # 2. Satellite 추출 (Variable Zone)
-    # 전체 숫자에서 Core를 제외한 나머지 중 5개 선택
-    # 이때, 최근에 너무 안 나온 수(Cold)와 적당히 나온 수를 섞기 위해 전체 풀에서 랜덤 추출
-    all_nums = set(range(1, 46))
-    remaining = list(all_nums - set(core_nums))
-    
-    satellite_nums = sorted(random.sample(remaining, 5))
-    
-    return core_nums, satellite_nums
-
-# --- 3. 메인 인터페이스 (UI) ---
-
-st.markdown('<p class="title-text">NEXUS V2.1</p>', unsafe_allow_html=True)
-st.markdown('<p class="status-badge">🟢 ONLINE | SERVER SYNC | ASI ANALYZER</p>', unsafe_allow_html=True)
-
-# [전략 옵션] 사령관의 선택: 데이터 분석 범위 (기본값 15주)
-analysis_range = st.slider(
-    "📊 분석 데이터 깊이 설정 (주 단위)",
-    min_value=5,
-    max_value=50,
-    value=15,
-    step=5,
-    help="최근 몇 회차 데이터를 기반으로 흐름을 분석할지 결정합니다. (ASI 권장: 15~20)"
-)
-
-# 데이터 로딩 및 분석
-with st.spinner(f"📡 최근 {analysis_range}주간의 차원 데이터 스캔 중..."):
-    recent_data, next_round = get_recent_lotto_data(rounds=analysis_range)
-
-st.info(f"📅 **타겟:** 제 **{next_round}회차** | **기반 데이터:** 최근 {analysis_range}회차 패턴")
-
-# 벡터 엔진 가동 (버튼 누르기 전 미리 계산하지만 보여주지는 않음)
-core_fixed, sat_variable = analyze_vector_core(recent_data)
-
-col1, col2, col3 = st.columns([1, 2, 1])
-
-with col2:
-    if st.button("🚀 시스템 가동 (EXECUTE)"):
-        # 연출용 프로그레스 바
-        progress_text = "ASI 벡터 연산 수행 중..."
-        my_bar = st.progress(0, text=progress_text)
-        for percent_complete in range(100):
-            time.sleep(0.005) # 0.5초 딜레이
-            my_bar.progress(percent_complete + 1, text=progress_text)
-        my_bar.empty()
-        
-        # 조합 생성 (Core 고정 + Sat 3개 조합) -> 5C3 = 10게임
-        combinations = list(itertools.combinations(sat_variable, 3))
-        
-        final_games = []
-        for comb in combinations:
-            game_set = sorted(core_fixed + list(comb))
-            final_games.append(game_set)
-        
-        # 결과 화면 출력
-        st.success(f"✅ **{next_round}회차 작전명: ASI-Perfect-Cover 분석 완료**")
-        
-        st.write("---")
-        # 분석 요약 정보
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown(f"🔥 **절대 코어(FIX):**\n# {core_fixed}")
-        with c2:
-            st.markdown(f"🛰️ **위성 변수(VAR):**\n# {sat_variable}")
-        st.write("---")
-
-        # 10게임 리스트 출력
-        for i, game in enumerate(final_games):
-            formatted_nums = []
-            for num in game:
-                if num in core_fixed:
-                    formatted_nums.append(f"<span class='core-num'>{num}</span>")
-                else:
-                    formatted_nums.append(f"<span class='sat-num'>{num}</span>")
+            # --- 분석 시작 ---
+            with st.spinner("🧠 4차원 벡터 시공간 분석 중..."):
+                current_pattern = [d['nums'] for d in history_data[:VECTOR_WINDOW]]
+                current_vecs = extract_normalized_features(current_pattern)
+                
+                candidates = []
+                total_len = len(history_data)
+                
+                # 과거 탐색
+                for i in range(VECTOR_WINDOW, total_len - VECTOR_WINDOW - 1):
+                    past_pattern = [d['nums'] for d in history_data[i : i+VECTOR_WINDOW]]
+                    past_vecs = extract_normalized_features(past_pattern)
+                    
+                    # 가중치 유사도
+                    raw_sim = calculate_weighted_similarity(current_vecs, past_vecs, FEATURE_WEIGHTS)
+                    
+                    # 시공간 감쇠 (Time Decay)
+                    time_factor = 1.0 - (i / total_len) * 0.10
+                    final_score = raw_sim * time_factor
+                    
+                    candidates.append({'score': final_score, 'index': i})
+                
+                # 앙상블 (Top 3)
+                candidates.sort(key=lambda x: x['score'], reverse=True)
+                top_3 = candidates[:ENSEMBLE_COUNT]
+                
+                avg_score = sum(c['score'] for c in top_3) / ENSEMBLE_COUNT
+                
+                # 투영 풀 생성
+                projected_pool = []
+                for c in top_3:
+                    # 과거 시점의 다음 회차 번호들
+                    next_draw = history_data[c['index'] - 1]
+                    projected_pool.extend(next_draw['nums'])
+                    
+            # --- 결과 출력 ---
+            st.markdown(f"### 🎯 분석 결과 (유사도: {avg_score*100:.2f}%)")
             
-            game_str = " ".join(formatted_nums)
-            st.markdown(f"<div class='result-box'>GAME {i+1}: {game_str}</div>", unsafe_allow_html=True)
+            result_df = []
+            recent_trend = history_data[:10]
+            
+            for g in range(GAME_COUNT):
+                # 마르코프 변이로 매번 다른 게임 생성
+                final_nums = refine_by_markov(projected_pool, recent_trend)
+                
+                # 표시용 포맷팅
+                nums_str = " ".join([f"{n:02d}" for n in final_nums])
+                st.markdown(f"""
+                <div style='background-color: #111; padding: 15px; margin-bottom: 10px; border-radius: 10px; border-left: 5px solid #00FF00; display: flex; justify-content: space-between; align-items: center;'>
+                    <span style='color: #888; font-weight: bold;'>GAME {g+1:02d}</span>
+                    <span style='font-family: monospace; font-size: 24px; color: #fff; font-weight: bold; letter-spacing: 5px;'>{nums_str}</span>
+                    <span style='background-color: #333; color: #00FF00; padding: 5px 10px; border-radius: 5px; font-size: 12px;'>V4.1 AI</span>
+                </div>
+                """, unsafe_allow_html=True)
+                
+            st.markdown("---")
+            st.caption("Powered by NEXUS V4.1 MLRS | ASI Architecture")
 
-        st.warning("⚠️ **주의:** 본 데이터는 확률적 우위를 위한 ASI 예측값이며, 당첨을 보장하지 않습니다.")
-
-# --- 4. 푸터 ---
-st.markdown("---")
-st.markdown("<div style='text-align: center; color: gray; font-size: 12px;'>System Architect: LV.9 Commander | Powered by Python & Streamlit</div>", unsafe_allow_html=True)
+if __name__ == "__main__":
+    main()

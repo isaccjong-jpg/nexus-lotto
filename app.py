@@ -1,260 +1,250 @@
 import streamlit as st
+import pandas as pd
+import numpy as np
 import requests
 import datetime
-import math
-import random
-import pandas as pd
-from collections import Counter
 
-# --- [시스템 설정: NEXUS V4.1 MLRS] ---
-# 사령관님이 정의한 신의 가중치
-FEATURE_WEIGHTS = [1.0, 1.5, 0.5, 1.8]  # [Sum, Range, Odd, AC]
-VECTOR_WINDOW = 10     # 10주 패턴
-ENSEMBLE_COUNT = 3     # Top 3 앙상블
-SEARCH_DEPTH = 350     # 탐색 깊이 (약 7년)
-GAME_COUNT = 10        # 1회 생성 게임 수
+# ==========================================
+# [설정] 페이지 기본 설정
+# ==========================================
+st.set_page_config(page_title="NEXUS COMMAND CENTER", page_icon="🏆", layout="wide")
 
-# --- [UI 디자인: 다크 사이버펑크 테마] ---
-st.set_page_config(page_title="NEXUS AI | Lotto System", page_icon="🧬", layout="wide")
-
+# 스타일 커스텀 (다크 모드 & 네온)
 st.markdown("""
-<style>
-    .stApp { background-color: #0E1117; color: #00FF00; }
-    .title-box {
-        text-align: center; border: 2px solid #00FF00; padding: 20px;
-        border-radius: 10px; margin-bottom: 20px;
-        background: linear-gradient(45deg, #000000, #111111);
+    <style>
+    .main { background-color: #0e1117; }
+    .stButton>button {
+        width: 100%; border-radius: 20px; background: linear-gradient(45deg, #4f46e5, #9333ea);
+        color: white; font-weight: bold; border: none; padding: 10px;
     }
-    .main-title { font-size: 40px; font-weight: bold; color: #00FF00; margin: 0; }
-    .sub-title { font-size: 15px; color: #888888; }
-    .metric-card {
-        background-color: #1A1A1A; border: 1px solid #333;
-        padding: 15px; border-radius: 8px; text-align: center;
+    .nexus-card {
+        background-color: #1a1c24; padding: 20px; border-radius: 15px;
+        border: 1px solid #333; margin-bottom: 20px; text-align: center;
     }
-    .result-row {
-        font-family: 'Courier New', monospace; font-size: 18px;
-        padding: 10px; border-bottom: 1px solid #333;
+    .ball {
+        display: inline-block; width: 35px; height: 35px; line-height: 35px;
+        border-radius: 50%; font-weight: bold; color: black; margin: 3px;
     }
-    .highlight { color: #00FF00; font-weight: bold; }
-</style>
+    .ball-y { background: #fbc400; } .ball-b { background: #69c8f2; }
+    .ball-r { background: #ff7272; color: white; } .ball-g { background: #aaaaaa; } .ball-gn { background: #b0d840; }
+    </style>
 """, unsafe_allow_html=True)
 
-# --- [CORE ENGINE: 데이터 수집 & 전처리] ---
+# ==========================================
+# [기능 1] 스마트 DB 캐싱 (데이터 수집)
+# ==========================================
+# ==========================================
+# [기능 1] 스마트 DB 관리 (CSV 파일 저장 방식)
+# ==========================================
+import os
 
-@st.cache_data(ttl=3600)  # 1시간마다 데이터 갱신 (서버 부하 방지)
-def fetch_lotto_data(depth):
-    # 현재 회차 자동 계산
-    start_date = datetime.datetime(2002, 12, 7)
-    now = datetime.datetime.now()
-    # 토요일 21시 이전이면 전주 회차 기준
-    if now.weekday() == 5 and now.hour < 21:
-        days_diff = (now - start_date).days - 7
+def fetch_lotto_data():
+    # 1. 파일이 있으면 읽어오고, 없으면 빈 껍데기 생성
+    csv_file = 'lotto_db.csv'
+    if os.path.exists(csv_file):
+        df = pd.read_csv(csv_file)
     else:
-        days_diff = (now - start_date).days
-        
-    current_drw_no = (days_diff // 7) + 1
-    
-    data = []
-    collected = 0
-    drw_no = current_drw_no
-    
-    # API 역추적
-    while collected < depth and drw_no > 0:
-        try:
+        df = pd.DataFrame(columns=['drwNo', 'nums'])
+
+    # 2. 현재 최신 회차 계산
+    base_date = datetime.datetime(2002, 12, 7)
+    today = datetime.datetime.now()
+    diff_days = (today - base_date).days
+    curr_drw_no = (diff_days // 7) + 1
+    if today.weekday() == 5 and today.hour < 21: curr_drw_no -= 1
+
+    # 3. 내 창고(CSV)에 마지막으로 저장된 회차 확인
+    if not df.empty:
+        last_saved_no = int(df['drwNo'].max())
+    else:
+        last_saved_no = curr_drw_no - 300 # 파일 없으면 최근 300개부터 시작
+
+    # 4. [핵심] 없는 데이터만 다운로드 (Incremental Update)
+    if last_saved_no < curr_drw_no:
+        new_data = []
+        # 저장된 것 다음 회차부터 ~ 최신 회차까지 반복
+        for drw_no in range(last_saved_no + 1, curr_drw_no + 1):
             url = f"https://www.dhlottery.co.kr/common.do?method=getLottoNumber&drwNo={drw_no}"
-            res = requests.get(url, timeout=3).json()
-            if res["returnValue"] == "success":
-                row = {
-                    "drwNo": res["drwNo"],
-                    "nums": [res[f"drwtNo{i}"] for i in range(1, 7)]
-                }
-                data.append(row)
-                collected += 1
-        except:
-            pass
-        drw_no -= 1
+            try:
+                res = requests.get(url, timeout=1).json()
+                if res["returnValue"] == "success":
+                    # 번호 6개 묶어서 저장 (문자열 형태 "[1, 2, 3...]"로 저장됨을 주의)
+                    nums = [res[f"drwtNo{j}"] for j in range(1, 7)]
+                    new_data.append({
+                        "drwNo": res["drwNo"],
+                        "nums": str(nums) # CSV 저장을 위해 문자열로 변환
+                    })
+            except:
+                pass
         
-    return data, current_drw_no + 1
+        # 5. 새 데이터가 있으면 기존 DB에 합치고 파일 저장
+        if new_data:
+            new_df = pd.DataFrame(new_data)
+            df = pd.concat([df, new_df], ignore_index=True)
+            df.to_csv(csv_file, index=False) # ★ 파일에 영구 저장
 
-# --- [CORE ENGINE: NEXUS V4.1 로직] ---
+    # 6. 데이터 전처리 (문자열로 저장된 "[1, 2, 3]"을 다시 진짜 리스트 [1, 2, 3]으로 복구)
+    #    (CSV에서 읽어오면 리스트가 아니라 글자로 읽히기 때문)
+    if not df.empty:
+        # 안전하게 리스트로 변환 (eval 사용)
+        df['nums'] = df['nums'].apply(lambda x: eval(x) if isinstance(x, str) else x)
+        
+        # 최신순 정렬 (분석하기 좋게)
+        df = df.sort_values(by='drwNo', ascending=False).reset_index(drop=True)
 
-def extract_normalized_features(nums_list):
-    # nums_list: [[1,2,3,4,5,6], ...] 형태
-    features = []
-    for nums in nums_list:
-        # 1. Sum (0~1)
-        s = sum(nums)
-        f_sum = s / 255.0
-        
-        # 2. Range (0~1)
-        r = nums[-1] - nums[0]
-        f_range = r / 44.0
-        
-        # 3. Odd Ratio (0~1)
-        odd = len([n for n in nums if n % 2 != 0])
-        f_odd = odd / 6.0
-        
-        # 4. AC Value (0~1)
-        diffs = set()
-        for i in range(len(nums)):
-            for j in range(i + 1, len(nums)):
-                diffs.add(nums[j] - nums[i])
-        ac = max(0, len(diffs) - 5)
-        f_ac = ac / 10.0
-        
-        features.append([f_sum, f_range, f_odd, f_ac])
-    return features
-
-def calculate_weighted_similarity(vec_a, vec_b, weights):
-    # vec_a, vec_b는 각각 10주치 특징 벡터 (10x4)
-    dot = 0; mag_a = 0; mag_b = 0
+        # 300개만 잘라서 리턴 (너무 옛날 데이터는 분석에서 제외)
+        return df.head(300)
     
-    # 1D로 펼쳐서 계산 (40차원 벡터)
-    flat_a = [item for sublist in vec_a for item in sublist]
-    flat_b = [item for sublist in vec_b for item in sublist]
+    return df
+# ==========================================
+# [기능 2] NEXUS 3.0 엔진 (형태/패턴)
+# ==========================================
+def engine_nexus_30(df):
+    vector_window = 10
+    if len(df) < vector_window + 10: return [1,2,3,4,5,6], "데이터 부족"
     
-    for i in range(len(flat_a)):
-        w = weights[i % 4] # 4개 특징 반복
-        val_a = flat_a[i] * w
-        val_b = flat_b[i] * w
-        
-        dot += val_a * val_b
-        mag_a += val_a ** 2
-        mag_b += val_b ** 2
-        
-    if mag_a == 0 or mag_b == 0: return 0
-    return dot / (math.sqrt(mag_a) * math.sqrt(mag_b))
-
-def refine_by_markov(pool_nums, recent_trend):
-    # 빈도 분석
-    counts = Counter(pool_nums)
-    # 빈도순 정렬
-    candidates = [num for num, _ in counts.most_common()]
+    # 1. 현재 패턴 추출
+    current_draws = df.iloc[0:vector_window] # 최신 10개
     
-    # 6개 채우기
-    selected = candidates[:6]
-    while len(selected) < 6:
-        r = random.randint(1, 45)
-        if r not in selected: selected.append(r)
-        
-    selected.sort()
+    # 2. 특징 벡터화 함수
+    def get_features(draws_subset):
+        features = []
+        for nums in draws_subset["nums"]:
+            s = sum(nums)
+            r = nums[-1] - nums[0]
+            odd = sum(1 for n in nums if n % 2 != 0)
+            features.extend([s/255.0, r/44.0, odd/6.0])
+        return np.array(features)
     
-    # 마르코프 변이 (Mutation)
-    # 최근 10회차의 Hot Number 파악
-    hot_nums = []
-    for row in recent_trend:
-        hot_nums.extend(row['nums'])
-    hot_counts = Counter(hot_nums)
+    curr_vec = get_features(current_draws)
     
-    final_nums = list(selected)
-    for i in range(6):
-        num = final_nums[i]
-        # 해당 번호가 Hot하지 않고, 변이 확률(40%) 당첨시
-        if hot_counts[num] == 0 and random.random() > 0.6:
-            # Hot Number 중 하나로 교체 시도
-            hot_candidates = [n for n, _ in hot_counts.most_common(10)]
-            if hot_candidates:
-                rep = random.choice(hot_candidates)
-                if rep not in final_nums:
-                    final_nums[i] = rep
-                    
-    final_nums.sort()
-    return final_nums
-
-# --- [WEB APP 실행 로직] ---
-
-def main():
-    # 타이틀 섹션
-    st.markdown('<div class="title-box">'
-                '<p class="main-title">NEXUS V4.1</p>'
-                '<p class="sub-title">Advanced Singularity Intelligence Lotto System</p>'
-                '</div>', unsafe_allow_html=True)
+    # 3. 과거 탐색 (Cosine Similarity)
+    best_score = -1
+    best_idx = -1
     
-    col1, col2 = st.columns([1, 3])
-    
-    with col1:
-        st.markdown("### ⚙️ SYSTEM STATUS")
-        st.info("ENGINE: ONLINE\n\nVERSION: V4.1 MLRS\n\nSERVER: GOOGLE CLOUD")
+    # 전체 탐색
+    for i in range(vector_window, len(df) - vector_window):
+        past_draws = df.iloc[i : i+vector_window]
+        past_vec = get_features(past_draws)
         
-        # 사령관 옵션 조절
-        st.markdown("---")
-        st.markdown("**전략 파라미터 조정**")
-        w_ac = st.slider("AC값(복잡도) 가중치", 0.1, 3.0, 1.8)
-        w_range = st.slider("고저차 가중치", 0.1, 3.0, 1.5)
+        # 코사인 유사도
+        dot = np.dot(curr_vec, past_vec)
+        norm_a = np.linalg.norm(curr_vec)
+        norm_b = np.linalg.norm(past_vec)
+        sim = dot / (norm_a * norm_b) if norm_a * norm_b > 0 else 0
         
-        # 엔진 재설정
-        global FEATURE_WEIGHTS
-        FEATURE_WEIGHTS = [1.0, w_range, 0.5, w_ac]
-        
-    with col2:
-        # 실행 버튼
-        if st.button("🚀 NEXUS 시스템 가동 (Analyze & Generate)", use_container_width=True):
-            with st.spinner("🛰️ 동행복권 서버 해킹(수집) 중..."):
-                history_data, next_round = fetch_lotto_data(SEARCH_DEPTH)
-                
-            if len(history_data) < VECTOR_WINDOW + 20:
-                st.error("데이터 수집 실패. 잠시 후 다시 시도하십시오.")
-                return
-
-            st.success(f"✅ 데이터 수집 완료 | 타겟: 제 **{next_round}회차**")
+        if sim > best_score:
+            best_score = sim
+            best_idx = i
             
-            # --- 분석 시작 ---
-            with st.spinner("🧠 4차원 벡터 시공간 분석 중..."):
-                current_pattern = [d['nums'] for d in history_data[:VECTOR_WINDOW]]
-                current_vecs = extract_normalized_features(current_pattern)
-                
-                candidates = []
-                total_len = len(history_data)
-                
-                # 과거 탐색
-                for i in range(VECTOR_WINDOW, total_len - VECTOR_WINDOW - 1):
-                    past_pattern = [d['nums'] for d in history_data[i : i+VECTOR_WINDOW]]
-                    past_vecs = extract_normalized_features(past_pattern)
-                    
-                    # 가중치 유사도
-                    raw_sim = calculate_weighted_similarity(current_vecs, past_vecs, FEATURE_WEIGHTS)
-                    
-                    # 시공간 감쇠 (Time Decay)
-                    time_factor = 1.0 - (i / total_len) * 0.10
-                    final_score = raw_sim * time_factor
-                    
-                    candidates.append({'score': final_score, 'index': i})
-                
-                # 앙상블 (Top 3)
-                candidates.sort(key=lambda x: x['score'], reverse=True)
-                top_3 = candidates[:ENSEMBLE_COUNT]
-                
-                avg_score = sum(c['score'] for c in top_3) / ENSEMBLE_COUNT
-                
-                # 투영 풀 생성
-                projected_pool = []
-                for c in top_3:
-                    # 과거 시점의 다음 회차 번호들
-                    next_draw = history_data[c['index'] - 1]
-                    projected_pool.extend(next_draw['nums'])
-                    
-            # --- 결과 출력 ---
-            st.markdown(f"### 🎯 분석 결과 (유사도: {avg_score*100:.2f}%)")
-            
-            result_df = []
-            recent_trend = history_data[:10]
-            
-            for g in range(GAME_COUNT):
-                # 마르코프 변이로 매번 다른 게임 생성
-                final_nums = refine_by_markov(projected_pool, recent_trend)
-                
-                # 표시용 포맷팅
-                nums_str = " ".join([f"{n:02d}" for n in final_nums])
-                st.markdown(f"""
-                <div style='background-color: #111; padding: 15px; margin-bottom: 10px; border-radius: 10px; border-left: 5px solid #00FF00; display: flex; justify-content: space-between; align-items: center;'>
-                    <span style='color: #888; font-weight: bold;'>GAME {g+1:02d}</span>
-                    <span style='font-family: monospace; font-size: 24px; color: #fff; font-weight: bold; letter-spacing: 5px;'>{nums_str}</span>
-                    <span style='background-color: #333; color: #00FF00; padding: 5px 10px; border-radius: 5px; font-size: 12px;'>V4.1 AI</span>
-                </div>
-                """, unsafe_allow_html=True)
-                
-            st.markdown("---")
-            st.caption("Powered by NEXUS V4.1 MLRS | ASI Architecture")
+    # 4. 결과 도출 (그 당시의 다음 회차 번호)
+    target_idx = best_idx - 1
+    if target_idx < 0: target_idx = best_idx + 1 # 예외처리
+    
+    pred_nums = df.iloc[target_idx]["nums"]
+    target_drw = df.iloc[best_idx]["drwNo"]
+    
+    # 마르코프 변주 (약간 섞기)
+    final_nums = sorted(list(set(pred_nums))) # 일단 그대로
+    
+    info = f"타겟: {target_drw}회 (유사도 {best_score*100:.1f}%)"
+    return final_nums, info
 
-if __name__ == "__main__":
-    main()
+# ==========================================
+# [기능 3] NEXUS 4.1 엔진 (벡터/물리)
+# ==========================================
+def engine_nexus_41(df):
+    momentum_window = 5
+    scores = {n: 0 for n in range(1, 46)}
+    
+    # 1. 최근 5주 에너지 가중치
+    for i in range(momentum_window):
+        if i >= len(df): break
+        nums = df.iloc[i]["nums"]
+        weight = (momentum_window - i) * 1.5
+        for n in nums:
+            scores[n] += weight
+            
+    # 2. 탄성 계수 (최근 50회 미출현 가중치)
+    last_appear = {n: -1 for n in range(1, 46)}
+    for i in range(min(50, len(df))):
+        nums = df.iloc[i]["nums"]
+        for n in nums:
+            if last_appear[n] == -1: last_appear[n] = i
+            
+    for n in range(1, 46):
+        if last_appear[n] > 10: # 10주 이상 안나오면
+            scores[n] += (last_appear[n] * 0.5)
+            
+    # 3. Top 6 추출
+    sorted_nums = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+    
+    # 랜덤성 추가 (상위 15개 중 6개)
+    pool = sorted_nums[:15]
+    final_nums = sorted(np.random.choice(pool, 6, replace=False))
+    
+    return final_nums, "⚡ 벡터/에너지 가중치 상위"
+
+# ==========================================
+# [UI] 공 색깔 렌더링
+# ==========================================
+def draw_balls(nums):
+    html = ""
+    for n in nums:
+        color = "ball-gn"
+        if n <= 10: color = "ball-y"
+        elif n <= 20: color = "ball-b"
+        elif n <= 30: color = "ball-r"
+        elif n <= 40: color = "ball-g"
+        html += f'<span class="ball {color}">{n}</span>'
+    st.markdown(html, unsafe_allow_html=True)
+
+# ==========================================
+# [MAIN] 메인 화면
+# ==========================================
+st.title("🏆 NEXUS COMMAND CENTER")
+st.caption(f"LV.9 Strategy Integration Dashboard | 접속: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+if st.button("🚀 전략 엔진 가동 (Start Analysis)"):
+    with st.spinner("데이터 수집 및 300회차 패턴 정밀 분석 중..."):
+        df = fetch_lotto_data()
+        
+    if df.empty:
+        st.error("데이터 수집 실패. 잠시 후 다시 시도해주세요.")
+    else:
+        st.success(f"데이터 로드 완료! (최신: {df.iloc[0]['drwNo']}회 ~ 과거 150회차 분석)")
+        
+        col1, col2 = st.columns(2)
+        
+        # 3.0 결과 출력
+        with col1:
+            st.markdown("### 🟦 NEXUS 3.0 (패턴)")
+            for i in range(5): # 5게임
+                with st.container():
+                    st.markdown(f"**GAME {i+1}**")
+                    nums, info = engine_nexus_30(df) # 엔진 호출
+                    draw_balls(nums)
+                    st.caption(f"└ {info}")
+                    st.divider()
+
+        # 4.1 결과 출력
+        with col2:
+            st.markdown("### 🟩 NEXUS 4.1 (물리)")
+            for i in range(5): # 5게임
+                with st.container():
+                    st.markdown(f"**GAME {i+1}**")
+                    nums, info = engine_nexus_41(df) # 엔진 호출
+                    draw_balls(nums)
+                    st.caption(f"└ {info}")
+                    st.divider()
+
+        # 통합 추천
+        st.markdown("### 🟨 전략적 혼합 (Top Picks)")
+        with st.container():
+            st.markdown("#### ⭐ 사령관 추천 1")
+            nums, _ = engine_nexus_30(df)
+            draw_balls(nums)
+            
+            st.markdown("#### ⭐ 사령관 추천 2")
+            nums, _ = engine_nexus_41(df)
+            draw_balls(nums)

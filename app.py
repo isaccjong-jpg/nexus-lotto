@@ -154,7 +154,7 @@ def engine_nexus_30(df):
 # [기능 3] NEXUS 4.1 엔진 (벡터/물리)
 # ==========================================
 def engine_nexus_41(df):
-    momentum_window = 5
+    momentum_window = 10
     scores = {n: 0 for n in range(1, 46)}
     
     # 1. 최근 5주 에너지 가중치
